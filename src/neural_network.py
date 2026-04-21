@@ -10,10 +10,18 @@ except ImportError:
 
 
 class NeuralNetwork:
-    def __init__(self, layer_sizes, dropout_rate=0.3, seed=42):
+    def __init__(self, layer_sizes, dropout_rate=0.3, seed=42, pos_weight=1.0):
+        """Feed-forward NN with BCE loss.
+
+        pos_weight: weight applied to the positive class term in BCE. Values
+        > 1.0 up-weight toxic comments and act as an alternative to
+        oversampling for class imbalance. pos_weight=1.0 is the standard
+        unweighted BCE (default; preserves backward compatibility).
+        """
         self.layer_sizes = layer_sizes
         self.dropout_rate = dropout_rate
         self.seed = seed
+        self.pos_weight = float(pos_weight)
         self.rng = np.random.default_rng(seed)
 
         self.weights: List[np.ndarray] = []
@@ -68,13 +76,19 @@ class NeuralNetwork:
         self.cache = {"activations": activations, "preacts": preacts, "dropout_masks": dropout_masks}
         return y_hat
 
-    def compute_loss(self, y_pred, y_true):
+    def _sample_weight(self, y, pos_weight):
+        return np.where(y > 0.5, float(pos_weight), 1.0)
+
+    def compute_loss(self, y_pred, y_true, pos_weight=None):
         y_true = y_true.reshape(-1, 1).astype(np.float64)
         eps = 1e-8
         y_pred = np.clip(y_pred, eps, 1.0 - eps)
-        return -np.mean(y_true * np.log(y_pred) + (1.0 - y_true) * np.log(1.0 - y_pred))
+        w = self.pos_weight if pos_weight is None else float(pos_weight)
+        sw = self._sample_weight(y_true, w)
+        per_sample = y_true * np.log(y_pred) + (1.0 - y_true) * np.log(1.0 - y_pred)
+        return -np.mean(sw * per_sample)
 
-    def _compute_gradients(self, X, y, training=True):
+    def _compute_gradients(self, X, y, training=True, pos_weight=None):
         y = y.reshape(-1, 1).astype(np.float64)
         y_pred = self.forward(X, training=training)
         acts = self.cache["activations"]
@@ -85,7 +99,10 @@ class NeuralNetwork:
         grads_w = [np.zeros_like(w) for w in self.weights]
         grads_b = [np.zeros_like(b) for b in self.biases]
 
-        delta = (y_pred - y) / m
+        w_pos = self.pos_weight if pos_weight is None else float(pos_weight)
+        sw = self._sample_weight(y, w_pos)
+        # For BCE with per-sample weight s_i, dL/dz_out = s_i * (p - y) / m.
+        delta = sw * (y_pred - y) / m
         grads_w[-1] = acts[-2].T @ delta
         grads_b[-1] = np.sum(delta, axis=0, keepdims=True)
 
@@ -97,8 +114,8 @@ class NeuralNetwork:
 
         return grads_w, grads_b, y_pred
 
-    def backward(self, X, y, learning_rate, momentum=0.9):
-        grads_w, grads_b, _ = self._compute_gradients(X, y)
+    def backward(self, X, y, learning_rate, momentum=0.9, pos_weight=None):
+        grads_w, grads_b, _ = self._compute_gradients(X, y, pos_weight=pos_weight)
         self.last_grads_w = grads_w
         self.last_grads_b = grads_b
 
@@ -119,7 +136,12 @@ class NeuralNetwork:
         learning_rate=0.001,
         momentum=0.9,
         patience=5,
+        pos_weight=None,
     ):
+
+        if pos_weight is not None:
+            self.pos_weight = float(pos_weight)
+
         history = {"train_loss": [], "val_loss": [], "train_f1": [], "val_f1": []}
         n = X_train.shape[0]
 
@@ -181,6 +203,7 @@ class NeuralNetwork:
         payload["n_layers"] = np.array([len(self.weights)], dtype=np.int64)
         payload["dropout_rate"] = np.array([self.dropout_rate], dtype=np.float64)
         payload["seed"] = np.array([self.seed], dtype=np.int64)
+        payload["pos_weight"] = np.array([self.pos_weight], dtype=np.float64)
         payload["layer_sizes"] = np.array(self.layer_sizes, dtype=np.int64)
         for i, (w, b) in enumerate(zip(self.weights, self.biases)):
             payload[f"W{i}"] = w
@@ -191,6 +214,11 @@ class NeuralNetwork:
         data = np.load(path)
         self.dropout_rate = float(data["dropout_rate"][0])
         self.seed = int(data["seed"][0])
+        # pos_weight may not exist in older checkpoints; default to 1.0.
+        if "pos_weight" in data.files:
+            self.pos_weight = float(data["pos_weight"][0])
+        else:
+            self.pos_weight = 1.0
         self.layer_sizes = data["layer_sizes"].astype(np.int64).tolist()
         n_layers = int(data["n_layers"][0])
         self.weights = [data[f"W{i}"].astype(np.float64) for i in range(n_layers)]
